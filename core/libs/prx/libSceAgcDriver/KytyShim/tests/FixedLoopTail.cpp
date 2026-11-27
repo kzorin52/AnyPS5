@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <stdexcept>
 #include <map>
 #include <memory>
@@ -13,11 +15,12 @@ using namespace IR;
 using Op = ValueOpcode;
 using Wave = std::array<uint32_t, 64>;
 
-enum class Variant { Plain, Coherent, Atomic, Barrier, TwoWaves, OuterLane, ScalarLane, OtherMask, EscapeStep, NoBallot };
+enum class Variant { Plain, Coherent, Atomic, Barrier, TwoWaves, OuterLane, ScalarLane, OtherMask, EscapeStep, NoBallot, Dormant, DormantRead, DormantVote, DormantEscapes, Revived };
 
 struct Inputs {
 	Wave start;
 	Wave active;
+	Wave data {};
 };
 
 struct Result {
@@ -63,14 +66,36 @@ Result Run(const Inputs& input, Variant variant) {
 	};
 	const auto start = input_at(0);
 	const auto mask = input_at(1);
+	const auto data = input_at(2);
 	const Value active(&entry.AppendNewInst(Op::INotEqual32, {mask, Value(0u)}));
 	auto& cursor = header.AppendNewInst(Op::Phi, {}, static_cast<uint64_t>(Type::U32));
 	auto& payload = header.AppendNewInst(Op::Phi, {}, static_cast<uint64_t>(Type::U32));
 	cursor.AddPhiOperand(&entry, start);
 	payload.AddPhiOperand(&entry, Value(0u));
+	const bool dormant_test = variant == Variant::Dormant || variant == Variant::DormantRead ||
+	                          variant == Variant::DormantVote || variant == Variant::DormantEscapes || variant == Variant::Revived;
+	auto live_mask = active;
+	Inst* mask_phi = nullptr;
+	if (dormant_test) {
+		mask_phi = &header.AppendNewInst(Op::Phi, {}, static_cast<uint64_t>(Type::U1));
+		mask_phi->AddPhiOperand(&entry, active);
+		live_mask = Value(mask_phi);
+		payload.SetArg(0, data);
+	}
 	const Value unfinished(&test.AppendNewInst(Op::INotEqual32, {Value(&payload), Value(77u)}));
-	const Value live(&test.AppendNewInst(Op::LogicalAnd, {active, unfinished}));
-	test.condition = variant == Variant::NoBallot ? Value(true) : Value(&test.AppendNewInst(Op::ConditionRef, {live},
+	const Value live(&test.AppendNewInst(Op::LogicalAnd, {live_mask, unfinished}));
+	auto contributed = live;
+	if (variant == Variant::DormantVote || variant == Variant::DormantEscapes) {
+		const Value coordinate(&test.AppendNewInst(Op::BitCastF32U32, {data}));
+		const Value ordered(&test.AppendNewInst(Op::FPOrdEqual32, {coordinate, coordinate}));
+		if (variant == Variant::DormantVote) {
+			contributed = Value(&test.AppendNewInst(Op::LogicalOr, {live, ordered}));
+		} else {
+			const Value observable(&test.AppendNewInst(Op::SelectU32, {ordered, data, Value(1u)}));
+			exit.AppendNewInst(Op::ReferenceU32, {observable});
+		}
+	}
+	test.condition = variant == Variant::NoBallot ? Value(true) : Value(&test.AppendNewInst(Op::ConditionRef, {contributed},
 	                       static_cast<uint64_t>(CFG::BranchCondition::ExecNonZero)));
 	if (variant == Variant::OuterLane || variant == Variant::ScalarLane) {
 		const Value lane(&entry.AppendNewInst(Op::GetBuiltin,
@@ -96,7 +121,16 @@ Result Run(const Inputs& input, Variant variant) {
 	const auto read_mask = variant == Variant::OtherMask ? active : live;
 	const Value loaded(&latch.AppendNewInst(Op::LoadBufferU32,
 	                                       {resource, Value(&cursor), Value(0u), Value(0u), read_mask}));
-	payload.AddPhiOperand(&latch, Value(&latch.AppendNewInst(Op::SelectU32, {live, loaded, Value(&payload)})));
+	auto next_payload = loaded;
+	if (dormant_test) {
+		const Value coordinate(&latch.AppendNewInst(Op::BitCastF32U32, {data}));
+		const Value ordered(&latch.AppendNewInst(Op::FPOrdEqual32, {coordinate, coordinate}));
+		next_payload = Value(&latch.AppendNewInst(Op::SelectU32, {ordered, data, loaded}));
+		if (variant == Variant::DormantRead)
+			latch.AppendNewInst(Op::LoadBufferU32, {resource, Value(0u), Value(0u), Value(0u), Value(true)});
+		mask_phi->AddPhiOperand(&latch, variant == Variant::Revived ? Value(true) : live);
+	}
+	payload.AddPhiOperand(&latch, Value(&latch.AppendNewInst(Op::SelectU32, {live, next_payload, Value(&payload)})));
 	const Value increment(&latch.AppendNewInst(Op::IAdd32, {Value(&cursor), Value(1u)}));
 	const Value step(&latch.AppendNewInst(Op::SelectU32, {live, increment, Value(&cursor)}));
 	cursor.AddPhiOperand(&latch, step);
@@ -122,6 +156,7 @@ Result Run(const Inputs& input, Variant variant) {
 	std::map<const Inst*, Wave> values;
 	values[start.Instruction()] = input.start;
 	values[mask.Instruction()] = input.active;
+	values[data.Instruction()] = input.data;
 	values[active.Instruction()] = input.active;
 	const auto read = [&](Value value, size_t lane) -> uint32_t {
 		if (const auto* inst = value.TryInstruction()) return values.at(inst)[lane];
@@ -153,6 +188,15 @@ Result Run(const Inputs& input, Variant variant) {
 			for (size_t i = 0; i < output.size(); ++i) {
 				const auto arg = [&](size_t n) { return read(inst.Arg(n), i); };
 				switch (op) {
+					case Op::FPOrdEqual32: {
+						const auto left = std::bit_cast<float>(arg(0));
+						const auto right = std::bit_cast<float>(arg(1));
+						output[i] = !std::isnan(left) && !std::isnan(right) && left == right;
+						break;
+					}
+					case Op::BitCastU32F32:
+					case Op::BitCastF32U32: output[i] = arg(0); break;
+					case Op::BitwiseAnd32: output[i] = arg(0) & arg(1); break;
 					case Op::LoadBufferU32: output[i] = arg(4) && arg(1) == 0 ? 77u : 0u; break;
 					case Op::SelectU32: output[i] = arg(0) ? arg(1) : arg(2); break;
 					case Op::IAdd32: output[i] = arg(0) + arg(1); break;
@@ -201,6 +245,23 @@ bool TestFixedLoopTail() {
 	for (const auto variant: {Variant::OuterLane, Variant::ScalarLane, Variant::OtherMask, Variant::EscapeStep, Variant::NoBallot}) {
 		const auto r = Run(input, variant);
 		if (!r.guarded || r.rewritten) return false;
+	}
+	for (const auto payload: {0x7fc00031u, 0xffc0abcdu, 0x7f800001u, 0xff801234u}) {
+		Inputs masked {};
+		masked.start.fill(23);
+		masked.active[0] = 1;
+		masked.data[63] = payload;
+		for (const auto variant: {Variant::Dormant, Variant::DormantRead, Variant::DormantVote, Variant::DormantEscapes}) {
+			const auto r = Run(masked, variant);
+			if (!r.guarded || !r.rewritten || r.turns != (variant == Variant::Dormant ? 2u : 16u) ||
+			    r.cursor[0] != 39u || r.cursor[63] != 23u || r.payload[63] != payload || r.marks != 64u) return false;
+		}
+		masked.active[63] = 1;
+		const auto active_nan = Run(masked, Variant::Dormant);
+		if (active_nan.turns != 16u || active_nan.cursor[63] != 39u || active_nan.marks != 64u) return false;
+		masked.active[63] = 0;
+		const auto revived = Run(masked, Variant::Revived);
+		if (revived.turns != 16u || revived.cursor[63] != 38u || revived.marks != 64u) return false;
 	}
 	input.start[63] = UINT32_MAX - 3u;
 	const auto reference = Run(input, Variant::TwoWaves);

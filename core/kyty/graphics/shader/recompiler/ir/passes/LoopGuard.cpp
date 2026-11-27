@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -351,6 +352,73 @@ FixedTraversal FindFixedTraversal(const Program& program, size_t first, size_t l
 	return plan;
 }
 
+bool InertWhenClear(const Program& program, size_t first, size_t last, Inst& mask) {
+	std::unordered_map<const Inst*, Value> known;
+	const auto get = [&](Value arg) {
+		arg = arg.Resolve();
+		const auto* inst = arg.TryInstruction();
+		if (inst == nullptr || !InsideLoop(program, inst->Parent(), first, last)) return arg;
+		const auto it = known.find(inst);
+		return it == known.end() ? Value {} : it->second;
+	};
+	const Value on(true), off(false);
+	auto& header = *program.blocks[first];
+	const auto* latch = program.blocks[last];
+	for (size_t at = first; at <= last; ++at) {
+		for (auto& inst: *program.blocks[at]) {
+			const auto op = inst.GetOpcode();
+			Value result;
+			if (op == Op::Phi && at == first) {
+				result = &inst == &mask ? off : Value(&inst);
+			} else if (op == Op::Phi) {
+				result = get(inst.Arg(0));
+				for (size_t n = 1; n < inst.NumArgs(); ++n) {
+					if (result != get(inst.Arg(n))) { result = {}; break; }
+				}
+			} else if (op == Op::SelectU32) {
+				const auto condition = get(inst.Arg(0));
+				const auto yes = get(inst.Arg(1));
+				const auto no = get(inst.Arg(2));
+				if (condition == on || yes == no) result = yes;
+				else if (condition == off) result = no;
+			} else if (op == Op::LogicalNot) {
+				const auto value = get(inst.Arg(0));
+				if (value == on) result = off;
+				else if (value == off) result = on;
+			} else if (op == Op::LogicalAnd || op == Op::LogicalOr) {
+				const auto left = get(inst.Arg(0)), right = get(inst.Arg(1));
+				const auto absorbing = op == Op::LogicalAnd ? off : on;
+				const auto neutral = op == Op::LogicalAnd ? on : off;
+				if (left == absorbing || right == absorbing) result = absorbing;
+				else if (left == neutral || left == right) result = right;
+				else if (right == neutral) result = left;
+			} else if (op == Op::Reference) {
+				if (inst.Arg(0) != program.blocks[at]->condition) return false;
+			} else if (op == Op::ConditionRef) {
+				const auto value = get(inst.Arg(0));
+				if (value != off && value != on) return false;
+			} else if (PlainRead(program, inst)) {
+				if (get(inst.Arg(4)) != off) return false;
+			} else if (!PlainLoopInstruction(op)) {
+				return false;
+			}
+			if (result.IsEmpty()) {
+				if (std::ranges::any_of(inst.Uses(), [&](const Use& use) {
+					return !InsideLoop(program, use.user->Parent(), first, last);
+				})) return false;
+			} else {
+				known.emplace(&inst, result);
+			}
+		}
+	}
+	for (auto& phi: header) {
+		if (phi.GetOpcode() != Op::Phi) break;
+		const auto back = phi.PhiBlock(0) == latch ? 0 : 1;
+		if (get(phi.Arg(back)) != get(Value(&phi))) return false;
+	}
+	return true;
+}
+
 Value Append(Block& block, Op op, std::initializer_list<Value> args) {
 	return Value(&block.AppendNewInst(op, args));
 }
@@ -400,10 +468,11 @@ Value DeterminateInputs(const Program& program, size_t first, size_t last) {
 }
 
 void SkipFixedTail(const Program& program, const FixedTraversal& plan, Inst& count, Value next, uint32_t limit,
-                   size_t first, size_t last) {
+                   size_t first, size_t last, Value inert_mask) {
 	auto& latch = *program.blocks[last];
 	const auto add = [&](Op op, std::initializer_list<Value> args) { return Append(latch, op, args); };
 	auto stable = DeterminateInputs(program, first, last);
+	if (!inert_mask.IsEmpty()) stable = add(Op::LogicalOr, {add(Op::LogicalNot, {inert_mask}), stable});
 	for (auto& phi: *program.blocks[first]) {
 		if (phi.GetOpcode() != Op::Phi) break;
 		if (&phi == &count || &phi == plan.cursor) continue;
@@ -474,6 +543,16 @@ static const char* GuardLoopImpl(Program& program, Block& header, uint32_t limit
 	const bool can_skip = fixed_tail && plain && exit != nullptr && latch == program.blocks[last] &&
 	                      ScopeOfBranch(exit->condition) == BranchScope::WaveVote;
 	const auto plan = can_skip ? FindFixedTraversal(program, first, last) : FixedTraversal {};
+	Value inert_mask;
+	if (plan.cursor != nullptr) {
+		for (auto& phi: header) {
+			if (phi.GetOpcode() != Op::Phi) break;
+			if (phi.GetType() == Type::U1 && InertWhenClear(program, first, last, phi)) {
+				inert_mask = Value(&phi);
+				break;
+			}
+		}
+	}
 	auto& count = *header.PrependNewInst(header.begin(), ValueOpcode::Phi);
 	count.SetFlags(Type::U32);
 	const auto body = std::ranges::find_if(header, [](const Inst& inst) { return inst.GetOpcode() != ValueOpcode::Phi; });
@@ -481,7 +560,7 @@ static const char* GuardLoopImpl(Program& program, Block& header, uint32_t limit
 	for (auto* pred: header.ImmPredecessors()) {
 		count.AddPhiOperand(pred, pred == latch ? Value(&next) : Value(0u));
 	}
-	if (plan.cursor != nullptr) SkipFixedTail(program, plan, count, Value(&next), limit, first, last);
+	if (plan.cursor != nullptr) SkipFixedTail(program, plan, count, Value(&next), limit, first, last, inert_mask);
 	if (conditional) {
 		LeaveAfter(*latch, header, Value(&next), limit, mark);
 		return nullptr;
